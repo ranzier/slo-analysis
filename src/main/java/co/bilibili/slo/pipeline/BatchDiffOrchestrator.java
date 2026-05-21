@@ -181,7 +181,7 @@ public class BatchDiffOrchestrator {
                     }
                     outputWriter.writeJson(apiDir.resolve("target_logs.json"), targetLogs);
 
-                    // 聚合对比
+                    // 聚合对比表
                     Map<String, Object> baselineLogAgg = baselineAggCache.get(cacheKey);
                     Map<String, Object> targetLogAgg = logAggregator.aggregateLogs(targetLogs, 60);
                     outputWriter.writeJson(apiDir.resolve("baseline_aggregate.json"), baselineLogAgg);
