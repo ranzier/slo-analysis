@@ -1,0 +1,15 @@
+slo:
+  watcher:
+    base-url: https://cloud.bilibili.co/api/v1/slo/dashboard/statement/app_detail
+    error-panel-url: https://cloud.bilibili.co/api/v1/slo/dashboard/business/app_slo
+    cookie: "${WATCHER_COOKIE:}"
+  billions:
+    base-url: https://cloud.bilibili.co/api/v1/billions/log-query/search
+    cookie: "${BILLIONS_COOKIE:}"
+  output:
+    base-dir: ./output
+
+spring:
+  main:
+    banner-mode: off
+    web-application-type: none
