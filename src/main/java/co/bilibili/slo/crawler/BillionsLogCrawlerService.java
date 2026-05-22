@@ -28,6 +28,8 @@ public class BillionsLogCrawlerService {
         int page = 1;
         int pageSize = Math.min(limit, 200);
 
+        //log.info("[BillionsQuery] appId={}, query='{}', from={}, to={}, limit={}", appId, query, startTs, endTs, limit);
+
         while (allLogs.size() < limit) {
             Map<String, Object> payload = Map.of(
                     "appId", appId,
@@ -94,7 +96,24 @@ public class BillionsLogCrawlerService {
                     System.out.printf("  窗口 %d/%d (%d~%d): %d 条%n", i + 1, windows, wStart, wEnd, logs.size());
                 }
             } catch (Exception e) {
-                System.out.printf("  窗口 %d/%d (%d~%d): 查询失败(%s)，跳过%n", i + 1, windows, wStart, wEnd, e.getMessage());
+                // 查询超时时，拆分为两个子窗口重试
+                long wMid = (wStart + wEnd) / 2;
+                int halfLimit = perWindow / 2;
+                System.out.printf("  窗口 %d/%d (%d~%d): 查询超时，拆分重试%n", i + 1, windows, wStart, wEnd);
+                try {
+                    List<LogEntry> logs1 = searchLogs(appId, query, wStart, wMid, halfLimit);
+                    allLogs.addAll(logs1);
+                    System.out.printf("    子窗口1 (%d~%d): %d 条%n", wStart, wMid, logs1.size());
+                } catch (Exception e1) {
+                    System.out.printf("    子窗口1 (%d~%d): 仍失败(%s)，跳过%n", wStart, wMid, e1.getMessage());
+                }
+                try {
+                    List<LogEntry> logs2 = searchLogs(appId, query, wMid, wEnd, halfLimit);
+                    allLogs.addAll(logs2);
+                    System.out.printf("    子窗口2 (%d~%d): %d 条%n", wMid, wEnd, logs2.size());
+                } catch (Exception e2) {
+                    System.out.printf("    子窗口2 (%d~%d): 仍失败(%s)，跳过%n", wMid, wEnd, e2.getMessage());
+                }
             }
         }
 
@@ -170,8 +189,23 @@ public class BillionsLogCrawlerService {
                             i + 1, windows, wStart, wEnd, quotas[i], logs.size());
                 }
             } catch (Exception e) {
-                System.out.printf("  加权窗口 %d/%d (%d~%d): 查询失败(%s)，跳过%n",
-                        i + 1, windows, wStart, wEnd, e.getMessage());
+                long wMid = (wStart + wEnd) / 2;
+                int halfQuota = quotas[i] / 2;
+                System.out.printf("  加权窗口 %d/%d (%d~%d): 查询超时，拆分重试%n", i + 1, windows, wStart, wEnd);
+                try {
+                    List<LogEntry> logs1 = searchLogs(appId, query, wStart, wMid, halfQuota);
+                    allLogs.addAll(logs1);
+                    System.out.printf("    子窗口1 (%d~%d): %d 条%n", wStart, wMid, logs1.size());
+                } catch (Exception e1) {
+                    System.out.printf("    子窗口1 (%d~%d): 仍失败(%s)，跳过%n", wStart, wMid, e1.getMessage());
+                }
+                try {
+                    List<LogEntry> logs2 = searchLogs(appId, query, wMid, wEnd, halfQuota);
+                    allLogs.addAll(logs2);
+                    System.out.printf("    子窗口2 (%d~%d): %d 条%n", wMid, wEnd, logs2.size());
+                } catch (Exception e2) {
+                    System.out.printf("    子窗口2 (%d~%d): 仍失败(%s)，跳过%n", wMid, wEnd, e2.getMessage());
+                }
             }
         }
 

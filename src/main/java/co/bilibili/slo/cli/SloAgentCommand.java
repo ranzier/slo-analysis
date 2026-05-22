@@ -12,6 +12,8 @@ import picocli.CommandLine.Command;
                 PipelineCompareCommand.class,
                 FindIncreasedApisCommand.class,
                 BatchDiffCommand.class,
+                BatchDiffV2Command.class,
+                QueryLogCommand.class,
         })
 public class SloAgentCommand implements Runnable {
 

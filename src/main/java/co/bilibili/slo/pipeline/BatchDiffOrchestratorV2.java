@@ -12,14 +12,15 @@ import co.bilibili.slo.util.ApiNameParser;
 import co.bilibili.slo.util.DateParser;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 
-@Component
-public class BatchDiffOrchestrator {
+@Component("batchDiffOrchestratorV2")
+public class BatchDiffOrchestratorV2 {
 
     private final SloErrorCrawlerService errorCrawler;
     private final BillionsLogCrawlerService logCrawler;
@@ -28,7 +29,7 @@ public class BatchDiffOrchestrator {
     private final IncreasedApiOrchestrator increasedApiOrchestrator;
     private final OutputWriter outputWriter;
 
-    public BatchDiffOrchestrator(SloErrorCrawlerService errorCrawler,
+    public BatchDiffOrchestratorV2(SloErrorCrawlerService errorCrawler,
                                  BillionsLogCrawlerService logCrawler,
                                  LogAggregator logAggregator,
                                  PipelineCompareOrchestrator compareOrchestrator,
@@ -54,21 +55,97 @@ public class BatchDiffOrchestrator {
         ExecutorService executor = Executors.newFixedThreadPool(4);
         try {
             String baselineDate = DateParser.epochToDate(baselineStart);
-            Path outputBase = outputWriter.createRunDirectory("batch_diff", appPath);
+            Path outputBase = outputWriter.getOrCreateAppDirectory("batch_diffv2", appPath);
 
             log("应用: %s", appPath);
             log("基线日: %s", baselineDate);
             log("异常日数量: %d", targetRanges.size());
 
-            // 获取基线日错误面板（只拉一次）
-            log("获取基线日错误面板数据...");
+            // Step 1: 获取基线日错误面板
+            log("Step 1: 获取基线日错误面板数据...");
             Map<String, Object> baselineData = errorCrawler.fetchErrorData(appPath, baselineStart, baselineEnd);
             Map<String, Object> baselineAgg = compareOrchestrator.aggregateErrorPanel(baselineData);
             log("  基线日数据已就绪");
 
+            // Step 2: 从基线面板提取出错接口列表
+            log("Step 2: 提取基线日出错接口...");
+            Map<String, Double> apiTotals = (Map<String, Double>) baselineAgg.get("api_totals");
+            List<String> baselineApis = apiTotals.entrySet().stream()
+                    .filter(e -> e.getValue() > 0)
+                    .sorted(Comparator.comparingDouble(e -> -e.getValue()))
+                    .map(Map.Entry::getKey)
+                    .toList();
+
+            List<String> apisToFetch;
+            if (baselineApis.size() <= 5) {
+                apisToFetch = baselineApis;
+            } else {
+                apisToFetch = baselineApis.subList(0, Math.min(8, baselineApis.size()));
+            }
+            log("  基线日共 %d 个出错接口，选取 %d 个爬取日志", baselineApis.size(), apisToFetch.size());
+            for (String api : apisToFetch) {
+                log("    - %s (错误数: %.0f)", api, apiTotals.get(api));
+            }
+
+            // Step 3: 并行预爬基线日志（已有缓存则跳过）
+            Path baselineDir = outputBase.resolve("baseline");
+            Map<String, List<LogEntry>> baselineLogsCache = new ConcurrentHashMap<>();
+            Map<String, Map<String, Object>> baselineAggCache = new ConcurrentHashMap<>();
+
+            List<String> apisNeedCrawl = new ArrayList<>();
+            for (String api : apisToFetch) {
+                Path apiDir = baselineDir.resolve(ApiNameParser.safeDirName(api));
+                Path aggFile = apiDir.resolve("aggregate.json");
+                if (Files.exists(aggFile)) {
+                    Map<String, Object> cachedAgg = outputWriter.readJson(aggFile);
+                    if (cachedAgg != null) {
+                        baselineAggCache.put(api, cachedAgg);
+                        log("  [%s] 基线日志已有缓存，跳过爬取", api);
+                        continue;
+                    }
+                }
+                apisNeedCrawl.add(api);
+            }
+
+            if (apisNeedCrawl.isEmpty()) {
+                log("Step 3: 基线日志全部命中缓存，跳过爬取");
+            } else {
+                log("Step 3: 并行爬取基线日日志（%d/%d 个需爬取）...", apisNeedCrawl.size(), apisToFetch.size());
+                CompletableFuture<?>[] baselineFutures = apisNeedCrawl.stream()
+                        .map(api -> CompletableFuture.runAsync(() -> {
+                            try {
+                                String[] parsed = ApiNameParser.parse(api);
+                                String apiPath = parsed[0];
+                                String retCode = parsed[1];
+                                String query = ApiNameParser.buildLogQuery(appPath, apiPath, retCode);
+                                Path apiDir = baselineDir.resolve(ApiNameParser.safeDirName(api));
+
+                                log("  [%s] 爬取基线日志...", api);
+                                List<LogEntry> logs = logCrawler.searchLogsSampled(
+                                        appPath, query, baselineStart, baselineEnd, 48, 50);
+                                if (logs.isEmpty()) {
+                                    log("  [%s] 基线日无日志", api);
+                                    return;
+                                }
+                                baselineLogsCache.put(api, logs);
+                                outputWriter.writeJson(apiDir.resolve("logs.json"), logs);
+
+                                Map<String, Object> agg = logAggregator.aggregateLogs(logs, 60);
+                                baselineAggCache.put(api, agg);
+                                outputWriter.writeJson(apiDir.resolve("aggregate.json"), agg);
+                                log("  [%s] 基线日志完成: %d 条", api, logs.size());
+                            } catch (Exception e) {
+                                log("  [%s] 基线日志爬取失败: %s", api, e.getMessage());
+                            }
+                        }, executor))
+                        .toArray(CompletableFuture[]::new);
+
+                CompletableFuture.allOf(baselineFutures).join();
+            }
+            log("  基线日志就绪，共 %d 个接口有聚合数据", baselineAggCache.size());
+
+            // Step 4: 遍历异常日
             List<Map<String, Object>> summaryList = new ArrayList<>();
-            ConcurrentHashMap<String, List<LogEntry>> baselineLogsCache = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, Map<String, Object>> baselineAggCache = new ConcurrentHashMap<>();
 
             for (long[] targetRange : targetRanges) {
                 long targetStart = targetRange[0];
@@ -76,9 +153,15 @@ public class BatchDiffOrchestrator {
                 String targetDate = DateParser.epochToDate(targetStart);
                 Path dayDir = outputBase.resolve(targetDate);
 
-                log("\n--- 处理异常日: %s ---", targetDate);
+                // 检查该异常日是否已有完整数据
+                Path increasedApisFile = dayDir.resolve("increased_apis.json");
+                if (Files.exists(increasedApisFile)) {
+                    log("\n--- 异常日 %s 已有数据，跳过 ---", targetDate);
+                    continue;
+                }
 
-                // 获取该天错误面板
+                log("\n--- Step 4: 处理异常日: %s ---", targetDate);
+
                 Map<String, Object> targetData;
                 try {
                     targetData = errorCrawler.fetchErrorData(appPath, targetStart, targetEnd);
@@ -90,7 +173,6 @@ public class BatchDiffOrchestrator {
                 Map<String, Object> targetAgg = compareOrchestrator.aggregateErrorPanel(targetData);
                 CompareResult result = compareOrchestrator.compare(baselineAgg, targetAgg);
 
-                // 输出总量对比
                 log("  错误总量: 基线=%s, 异常=%s, 增量=%s, 倍数=%s",
                         result.totalDiff().get("baseline_total"), result.totalDiff().get("target_total"),
                         result.totalDiff().get("diff"), result.totalDiff().get("ratio"));
@@ -118,7 +200,7 @@ public class BatchDiffOrchestrator {
                     log("    %-50s 基线:%-8.0f 异常:%-8.0f 增量:%+.0f  %s", api.api(), api.baseline(), api.target(), api.diff(), ratioStr);
                 }
 
-                // 输出错误码分布变化
+                // 错误码分布变化
                 List<Map<String, Object>> codeDiffs = result.errorCodeDiff().stream()
                         .filter(m -> Math.abs(((Number) m.get("diff")).doubleValue()) > 0)
                         .toList();
@@ -131,7 +213,7 @@ public class BatchDiffOrchestrator {
 
                 outputWriter.writeJson(dayDir.resolve("increased_apis.json"), increased);
 
-                // 对每个增量接口检测异常时间段（纯内存计算，保持串行）
+                // 检测异常时间段
                 for (ApiDiff apiInfo : increased) {
                     List<ApiTimeWindowDetector.TimeWindow> windows = ApiTimeWindowDetector.detectTopWindows(
                             baselineData, targetData, apiInfo.api(), 3);
@@ -148,13 +230,13 @@ public class BatchDiffOrchestrator {
                     }
                 }
 
-                // 对每个增量接口并行采集日志
+                // 并行采集异常日日志（基线从缓存读取）
                 final Map<String, Object> finalBaselineData = baselineData;
                 final Map<String, Object> finalTargetData = targetData;
                 CompletableFuture<?>[] futures = increased.stream()
                         .map(apiInfo -> CompletableFuture.runAsync(() ->
-                                processApi(appPath, apiInfo, dayDir, baselineStart, baselineEnd,
-                                        targetStart, targetEnd, baselineLogsCache, baselineAggCache,
+                                processApi(appPath, apiInfo, dayDir,
+                                        targetStart, targetEnd, baselineAggCache,
                                         finalBaselineData, finalTargetData), executor))
                         .toArray(CompletableFuture[]::new);
 
@@ -171,7 +253,7 @@ public class BatchDiffOrchestrator {
             log("\n完成! 结果目录: %s", outputBase);
 
         } catch (Exception e) {
-            throw new RuntimeException("BatchDiff 执行失败: " + e.getMessage(), e);
+            throw new RuntimeException("BatchDiffV2 执行失败: " + e.getMessage(), e);
         } finally {
             executor.shutdown();
         }
@@ -179,10 +261,8 @@ public class BatchDiffOrchestrator {
 
     @SuppressWarnings("unchecked")
     private void processApi(String appPath, ApiDiff apiInfo, Path dayDir,
-                            long baselineStart, long baselineEnd,
                             long targetStart, long targetEnd,
-                            ConcurrentHashMap<String, List<LogEntry>> baselineLogsCache,
-                            ConcurrentHashMap<String, Map<String, Object>> baselineAggCache,
+                            Map<String, Map<String, Object>> baselineAggCache,
                             Map<String, Object> baselineData, Map<String, Object> targetData) {
         try {
             String[] parsed = ApiNameParser.parse(apiInfo.api());
@@ -191,22 +271,6 @@ public class BatchDiffOrchestrator {
             Path apiDir = dayDir.resolve(ApiNameParser.safeDirName(apiInfo.api()));
 
             String query = ApiNameParser.buildLogQuery(appPath, apiPath, retCode);
-            String cacheKey = apiInfo.api();
-
-            // 基线日：从缓存取或首次拉取
-            List<LogEntry> baselineLogs = baselineLogsCache.computeIfAbsent(cacheKey, k -> {
-                log("  [%s] 采集基线日日志...", apiInfo.api());
-                List<LogEntry> logs = logCrawler.searchLogsSampled(appPath, query, baselineStart, baselineEnd, 48, 50);
-                if (!logs.isEmpty()) {
-                    baselineAggCache.put(cacheKey, logAggregator.aggregateLogs(logs, 60));
-                }
-                return logs;
-            });
-
-            if (baselineLogs.isEmpty()) {
-                log("  [%s] 基线日无日志，跳过", apiInfo.api());
-                return;
-            }
 
             // 异常日采集
             log("  [%s] 采集异常日日志...", apiInfo.api());
@@ -223,18 +287,21 @@ public class BatchDiffOrchestrator {
                 return;
             }
 
-            outputWriter.writeJson(apiDir.resolve("baseline_logs.json"), baselineLogs);
             outputWriter.writeJson(apiDir.resolve("target_logs.json"), targetLogs);
 
-            // 聚合对比
-            Map<String, Object> baselineLogAgg = baselineAggCache.get(cacheKey);
+            // 聚合异常日
             Map<String, Object> targetLogAgg = logAggregator.aggregateLogs(targetLogs, 60);
-            outputWriter.writeJson(apiDir.resolve("baseline_aggregate.json"), baselineLogAgg);
             outputWriter.writeJson(apiDir.resolve("target_aggregate.json"), targetLogAgg);
 
-            Map<String, Object> diffResult = increasedApiOrchestrator.diffAggregates(baselineLogAgg, targetLogAgg);
-            outputWriter.writeJson(apiDir.resolve("diff_result.json"), diffResult);
-            log("  [%s] 对比完成", apiInfo.api());
+            // 从缓存读取基线聚合，做 diff 对比
+            Map<String, Object> baselineLogAgg = baselineAggCache.get(apiInfo.api());
+            if (baselineLogAgg != null) {
+                Map<String, Object> diffResult = increasedApiOrchestrator.diffAggregates(baselineLogAgg, targetLogAgg);
+                outputWriter.writeJson(apiDir.resolve("diff_result.json"), diffResult);
+                log("  [%s] 对比完成", apiInfo.api());
+            } else {
+                log("  [%s] 基线无缓存（新增接口），仅输出异常日聚合", apiInfo.api());
+            }
 
             // 按异常时间段爬取详细日志（加权采样）
             List<ApiTimeWindowDetector.TimeWindow> windows = ApiTimeWindowDetector.detectTopWindows(

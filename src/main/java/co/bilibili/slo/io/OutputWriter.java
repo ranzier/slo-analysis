@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
@@ -29,9 +30,24 @@ public class OutputWriter {
         return dir;
     }
 
+    public Path getOrCreateAppDirectory(String category, String appPath) throws IOException {
+        Path dir = Path.of(props.getOutput().getBaseDir(), category, appPath);
+        Files.createDirectories(dir);
+        return dir;
+    }
+
     public void writeJson(Path file, Object data) throws IOException {
         Files.createDirectories(file.getParent());
         objectMapper.writeValue(file.toFile(), data);
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> readJson(Path file) {
+        try {
+            return objectMapper.readValue(file.toFile(), Map.class);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     public void writeMarkdown(Path file, String content) throws IOException {

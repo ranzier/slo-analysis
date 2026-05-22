@@ -87,7 +87,7 @@ public class IncreasedApiOrchestrator {
                 String retCode = parsed[1];
                 Path apiDir = outputBase.resolve(ApiNameParser.safeDirName(apiInfo.api()));
 
-                String query = String.format("_server_path = '%s' AND ret = '%s'", apiPath, retCode);
+                String query = ApiNameParser.buildLogQuery(appPath, apiPath, retCode);
 
                 // 采集基线日日志
                 log("\n[%s] 采集基线日日志...", apiInfo.api());

@@ -76,7 +76,7 @@ public class PipelineDayOrchestrator {
                 long spikeEnd = parseDateTime(spike.end());
 
                 log("Step 3: 查询日志: %s ret=%s (%s ~ %s)...", apiPath, retCode, spike.start(), spike.end());
-                String query = String.format("_server_path = '%s' AND ret = '%s'", apiPath, retCode);
+                String query = ApiNameParser.buildLogQuery(appPath, apiPath, retCode);
                 List<LogEntry> logs;
                 try {
                     logs = logCrawler.searchLogsSampled(appPath, query, spikeStart, spikeEnd, 10, 200);

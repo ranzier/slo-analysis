@@ -134,7 +134,7 @@ public class PipelineOrchestrator {
 
                         // Step 5: 查询日志
                         log("Step 5: [%s] 查询日志: %s ret=%s...", dateStr, apiPath, retCode);
-                        String query = String.format("_server_path = '%s' AND ret = '%s'", apiPath, retCode);
+                        String query = ApiNameParser.buildLogQuery(appPath, apiPath, retCode);
                         List<LogEntry> logs;
                         try {
                             logs = logCrawler.searchLogsSampled(appPath, query, startTs, endTs, 10, 200);

@@ -31,6 +31,11 @@ public class LogAggregator {
         Map<String, DimAccum> byBusinessParam = new LinkedHashMap<>();
         Map<String, DimAccum> byRequestSize = new LinkedHashMap<>();
         Map<String, DimAccum> byTime = new LinkedHashMap<>();
+        Map<String, DimAccum> byTimeout = new LinkedHashMap<>();
+        Map<String, DimAccum> byRespSize = new LinkedHashMap<>();
+        Map<String, DimAccum> byCaller = new LinkedHashMap<>();
+        Map<String, DimAccum> byException = new LinkedHashMap<>();
+        Map<String, DimAccum> byClientRegion = new LinkedHashMap<>();
 
         List<Double> allTsValues = new ArrayList<>();
         Set<String> allTraces = new HashSet<>();
@@ -57,6 +62,17 @@ public class LogAggregator {
             String grpcError = extractGrpcError(log.getString("error"));
             String errorType = classifyError(statusCode, ret, grpcError);
             String statusDesc = log.getString("status.description");
+            String timeout = log.getString("timeout");
+            String timeoutQuota = log.getString("timeout_quota");
+            int respSize = log.getInt("resp.size");
+            String caller = log.getString("caller");
+            String callerPath = log.getString("caller-path");
+            if (caller.isEmpty()) caller = log.getString("caller.path");
+            String exceptionType = log.getString("exception.type");
+            String exceptionMsg = log.getString("exception.message");
+            String clientIp = log.getString("client-ip");
+            if (clientIp.isEmpty()) clientIp = log.getString("client_ip");
+            String ipRegion = log.getString("ip-region");
             Map<String, String> params = extractParams(log);
             int requestArraySize = extractRequestArraySize(log);
 
@@ -114,7 +130,41 @@ public class LogAggregator {
                 getAccum(byRequestSize, sizeBucket).add(traceId, mid, hostName, targetIp, ts);
             }
 
-            // 10. 时间桶
+            // 10. 超时配置维度
+            if (!timeout.isEmpty() || !timeoutQuota.isEmpty()) {
+                String toKey = "timeout=" + (timeout.isEmpty() ? "?" : timeout)
+                        + "|quota=" + (timeoutQuota.isEmpty() ? "?" : timeoutQuota);
+                DimAccum toAccum = getAccum(byTimeout, toKey);
+                toAccum.add(traceId, mid, hostName, targetIp, ts);
+                toAccum.extras.merge("error_types:" + errorType, 1, (a, b) -> (int) a + (int) b);
+            }
+
+            // 11. 响应体大小维度
+            if (respSize > 0) {
+                String rsBucket = respSize <= 1024 ? "0-1KB"
+                        : respSize <= 10240 ? "1-10KB"
+                        : respSize <= 102400 ? "10-100KB" : "100KB+";
+                getAccum(byRespSize, rsBucket).add(traceId, mid, hostName, targetIp, ts);
+            }
+
+            // 12. 调用方维度
+            String callerKey = !caller.isEmpty() ? caller : callerPath;
+            if (!callerKey.isEmpty()) {
+                getAccum(byCaller, callerKey).add(traceId, mid, hostName, targetIp, ts);
+            }
+
+            // 13. 异常类型维度
+            if (!exceptionType.isEmpty()) {
+                String excKey = exceptionType + (exceptionMsg.isEmpty() ? "" : "|" + truncate(exceptionMsg, 80));
+                getAccum(byException, excKey).add(traceId, mid, hostName, targetIp, ts);
+            }
+
+            // 14. 客户端区域维度
+            if (!ipRegion.isEmpty()) {
+                getAccum(byClientRegion, ipRegion).add(traceId, mid, hostName, targetIp, ts);
+            }
+
+            // 15. 时间桶
             String tb = timeBucket(timestamp, bucketSeconds);
             DimAccum tbAccum = getAccum(byTime, tb);
             tbAccum.add(traceId, mid, hostName, targetIp, ts);
@@ -127,7 +177,7 @@ public class LogAggregator {
 
         return buildOutput(totalLogs, allTsValues, allTraces, allMids, allHosts, allTargetIps,
                 byErrorClass, byErrorDesc, byServerPath, byPeerService, byHost, byTargetIp, byZone,
-                byBusinessParam, byRequestSize, byTime);
+                byBusinessParam, byRequestSize, byTimeout, byRespSize, byCaller, byException, byClientRegion, byTime);
     }
 
     @SuppressWarnings("unchecked")
@@ -143,6 +193,11 @@ public class LogAggregator {
                                             Map<String, DimAccum> byZone,
                                             Map<String, DimAccum> byBusinessParam,
                                             Map<String, DimAccum> byRequestSize,
+                                            Map<String, DimAccum> byTimeout,
+                                            Map<String, DimAccum> byRespSize,
+                                            Map<String, DimAccum> byCaller,
+                                            Map<String, DimAccum> byException,
+                                            Map<String, DimAccum> byClientRegion,
                                             Map<String, DimAccum> byTime) {
         Map<String, Object> tsStats = computeStats(allTsValues);
         Map<String, Object> output = new LinkedHashMap<>();
@@ -151,6 +206,8 @@ public class LogAggregator {
         Map<String, Object> globalSummary = new LinkedHashMap<>();
         globalSummary.put("total_logs", totalLogs);
         globalSummary.put("unique_trace_count", allTraces.size());
+        double retryRatio = allTraces.isEmpty() ? 1.0 : (double) totalLogs / allTraces.size();
+        globalSummary.put("retry_amplification_ratio", round4(retryRatio));
         globalSummary.put("unique_mid_count", allMids.size());
         globalSummary.put("unique_host_count", allHosts.size());
         globalSummary.put("unique_target_ip_count", allTargetIps.size());
@@ -215,6 +272,7 @@ public class LogAggregator {
                     row.put("count", e.getValue().count);
                     row.put("pct", round1(e.getValue().count * 100.0 / totalLogs));
                     row.put("avg_ts", round4(e.getValue().tsValues.stream().mapToDouble(Double::doubleValue).average().orElse(0)));
+                    row.put("p95_ts", computeP95(e.getValue().tsValues));
                     row.put("max_ts", e.getValue().tsValues.stream().mapToDouble(Double::doubleValue).max().orElse(0));
                     row.put("unique_target_ip_count", e.getValue().targetIps.size());
                     Map<String, Integer> descs = (Map<String, Integer>) e.getValue().extras.getOrDefault("error_descs", Map.of());
@@ -304,7 +362,94 @@ public class LogAggregator {
             output.put("10_请求体大小维度", reqSizes);
         }
 
-        // 11. 时间桶趋势
+        // 11. 超时配置维度
+        if (!byTimeout.isEmpty()) {
+            List<Map<String, Object>> timeouts = new ArrayList<>();
+            byTimeout.entrySet().stream()
+                    .sorted(Comparator.comparingInt(e -> -e.getValue().count))
+                    .limit(5)
+                    .forEach(e -> {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("timeout_config", e.getKey());
+                        row.put("count", e.getValue().count);
+                        row.put("pct", round1(e.getValue().count * 100.0 / totalLogs));
+                        row.put("avg_ts", round4(e.getValue().tsValues.stream().mapToDouble(Double::doubleValue).average().orElse(0)));
+                        row.put("p95_ts", computeP95(e.getValue().tsValues));
+                        String topErr = findTopExtra(e.getValue().extras, "error_types:");
+                        if (!topErr.isEmpty()) row.put("top_error_type", topErr);
+                        timeouts.add(row);
+                    });
+            output.put("11_超时配置维度", timeouts);
+        }
+
+        // 12. 响应体大小维度
+        if (!byRespSize.isEmpty()) {
+            List<Map<String, Object>> respSizes = new ArrayList<>();
+            for (String bucket : List.of("0-1KB", "1-10KB", "10-100KB", "100KB+")) {
+                DimAccum accum = byRespSize.get(bucket);
+                if (accum != null) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("bucket", bucket);
+                    row.put("count", accum.count);
+                    row.put("pct", round1(accum.count * 100.0 / totalLogs));
+                    row.put("avg_ts", round4(accum.tsValues.stream().mapToDouble(Double::doubleValue).average().orElse(0)));
+                    respSizes.add(row);
+                }
+            }
+            output.put("12_响应体大小维度", respSizes);
+        }
+
+        // 13. 调用方维度
+        if (!byCaller.isEmpty()) {
+            List<Map<String, Object>> callers = new ArrayList<>();
+            byCaller.entrySet().stream()
+                    .sorted(Comparator.comparingInt(e -> -e.getValue().count))
+                    .limit(5)
+                    .forEach(e -> {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("caller", e.getKey());
+                        row.put("count", e.getValue().count);
+                        row.put("pct", round1(e.getValue().count * 100.0 / totalLogs));
+                        callers.add(row);
+                    });
+            output.put("13_调用方维度", callers);
+        }
+
+        // 14. 异常类型维度
+        if (!byException.isEmpty()) {
+            List<Map<String, Object>> exceptions = new ArrayList<>();
+            byException.entrySet().stream()
+                    .sorted(Comparator.comparingInt(e -> -e.getValue().count))
+                    .limit(5)
+                    .forEach(e -> {
+                        String[] parts = e.getKey().split("\\|", 2);
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("exception_type", parts[0]);
+                        if (parts.length > 1) row.put("message", parts[1]);
+                        row.put("count", e.getValue().count);
+                        row.put("pct", round1(e.getValue().count * 100.0 / totalLogs));
+                        exceptions.add(row);
+                    });
+            output.put("14_异常类型维度", exceptions);
+        }
+
+        // 15. 客户端区域维度
+        if (!byClientRegion.isEmpty()) {
+            List<Map<String, Object>> regions = new ArrayList<>();
+            byClientRegion.entrySet().stream()
+                    .sorted(Comparator.comparingInt(e -> -e.getValue().count))
+                    .limit(5)
+                    .forEach(e -> {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("region", e.getKey());
+                        row.put("count", e.getValue().count);
+                        row.put("pct", round1(e.getValue().count * 100.0 / totalLogs));
+                        regions.add(row);
+                    });
+            output.put("15_客户端区域维度", regions);
+        }
+
+        // 16. 时间桶趋势
         List<Map<String, Object>> allBuckets = new ArrayList<>();
         byTime.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
@@ -332,7 +477,7 @@ public class LogAggregator {
                 .limit(5)
                 .sorted(Comparator.comparing(r -> (String) r.get("time_bucket")))
                 .toList();
-        output.put("11_时间桶趋势", topBuckets);
+        output.put("16_时间桶趋势", topBuckets);
 
         return output;
     }
@@ -343,6 +488,10 @@ public class LogAggregator {
 
     private double round4(double v) {
         return Math.round(v * 10000.0) / 10000.0;
+    }
+
+    private String truncate(String s, int maxLen) {
+        return s.length() <= maxLen ? s : s.substring(0, maxLen) + "...";
     }
 
     private String classifyError(int statusCode, int ret, String grpcError) {
@@ -418,6 +567,14 @@ public class LogAggregator {
             }
         }
         return topKey;
+    }
+
+    private double computeP95(List<Double> tsList) {
+        if (tsList.isEmpty()) return 0.0;
+        List<Double> sorted = new ArrayList<>(tsList);
+        Collections.sort(sorted);
+        int p95Index = (int) Math.ceil(sorted.size() * 0.95) - 1;
+        return sorted.get(Math.max(0, Math.min(p95Index, sorted.size() - 1)));
     }
 
     private Map<String, Object> computeStats(List<Double> tsList) {

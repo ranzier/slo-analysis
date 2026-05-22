@@ -1,6 +1,6 @@
 package co.bilibili.slo.cli;
 
-import co.bilibili.slo.pipeline.BatchDiffOrchestrator;
+import co.bilibili.slo.pipeline.BatchDiffOrchestratorV2;
 import co.bilibili.slo.util.DateParser;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -13,8 +13,8 @@ import java.util.List;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "batch-diff", description = "多天逐天对比：找出每天相对基线日错误增量显著的接口并对比日志")
-public class BatchDiffCommand implements Callable<Integer> {
+@Command(name = "batch-diffv2", description = "V2多天逐天对比：预爬基线日志，再逐天对比异常日")
+public class BatchDiffV2Command implements Callable<Integer> {
 
     @Parameters(index = "0", description = "应用服务名", arity = "0..1")
     private String appPath;
@@ -31,11 +31,11 @@ public class BatchDiffCommand implements Callable<Integer> {
     @Option(names = "--min-ratio", defaultValue = "1.5", description = "最小增长倍数 (默认: 1.5)")
     private double minRatio;
 
-    @Option(names = "--apis", description = "指定接口列表，逗号分隔，支持模糊匹配 (如 'Episode/ListBySeasonId,Season/Cards')")
+    @Option(names = "--apis", description = "指定接口列表，逗号分隔，支持模糊匹配")
     private String apis;
 
     @Autowired
-    private BatchDiffOrchestrator orchestrator;
+    private BatchDiffOrchestratorV2 orchestrator;
 
     @Override
     public Integer call() {

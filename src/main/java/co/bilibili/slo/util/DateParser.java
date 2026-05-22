@@ -40,13 +40,20 @@ public final class DateParser {
 
         int year = LocalDate.now().getYear();
 
-        // 手动解析 "X月Y" 或 "X月Y日" 格式
+        // 手动解析 "X月Y" 或 "X月Y日" 格式（可带时间）
         java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("^(\\d{1,2})月(\\d{1,2})日?$").matcher(dateStr);
+                .compile("^(\\d{1,2})月(\\d{1,2})日?(?:\\s+(\\d{1,2}):(\\d{2})(?::(\\d{2}))?)?$").matcher(dateStr);
         if (m.matches()) {
             int month = Integer.parseInt(m.group(1));
             int day = Integer.parseInt(m.group(2));
             LocalDate date = LocalDate.of(year, month, day);
+            if (m.group(3) != null) {
+                int hour = Integer.parseInt(m.group(3));
+                int minute = Integer.parseInt(m.group(4));
+                int second = m.group(5) != null ? Integer.parseInt(m.group(5)) : 0;
+                LocalDateTime dt = date.atTime(hour, minute, second);
+                return dt.atZone(ZONE).toEpochSecond();
+            }
             return date.atStartOfDay(ZONE).toEpochSecond();
         }
 
